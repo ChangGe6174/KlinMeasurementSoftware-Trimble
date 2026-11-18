@@ -1,0 +1,16 @@
+# Normalize source files to LF in the repository.
+* text=auto
+
+*.py text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
+*.spec text eol=lf
+
+# Keep binary measurement and application files out of text processing.
+*.xlsx binary
+*.xls binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.exe binary
