@@ -17,7 +17,7 @@ from analysis import (
     fit_circle_2d,
     fit_section_center_with_axis_projection,
     project_points_to_axis_section,
-    read_section_points,
+    read_section_points_with_rows,
 )
 from turret_position import TurretPositionWindow
 from txt2xlsx import convert_selected_files
@@ -244,7 +244,7 @@ class CircleCenterApp:
             x_values = section["x2d"]
             z_values = section["z2d"]
             center_x, center_z, radius = section["center_2d"]
-            ax.scatter(x_values, z_values, s=8, alpha=0.65, label="档位点")
+            ax.scatter(x_values, z_values, s=12, alpha=0.25, color="0.55", label="实际投影点")
             angles = np.linspace(0, 2 * np.pi, 361)
             ax.plot(
                 center_x + radius * np.cos(angles),
@@ -253,6 +253,81 @@ class CircleCenterApp:
                 label=f"拟合圆 R={radius:.2f} mm",
             )
             ax.scatter([center_x], [center_z], color="black", marker="x", label="拟合圆心")
+
+            point_distances = np.hypot(x_values - center_x, z_values - center_z)
+            radial_deviations = point_distances - radius
+            max_absolute_deviation = float(np.max(np.abs(radial_deviations)))
+            exaggeration = 1.0
+            if max_absolute_deviation > 1e-12:
+                exaggeration = float(np.clip(
+                    0.20 * radius / max_absolute_deviation,
+                    10.0,
+                    1000.0,
+                ))
+
+            visual_x = np.empty_like(x_values)
+            visual_z = np.empty_like(z_values)
+            for point_index, (x_value, z_value) in enumerate(zip(x_values, z_values)):
+                dx = x_value - center_x
+                dz = z_value - center_z
+                distance = float(np.hypot(dx, dz))
+                if distance > 1e-12:
+                    visual_radius = radius + exaggeration * (
+                        distance - radius
+                    )
+                    visual_radius = max(visual_radius, 0.0)
+                    visual_x[point_index] = center_x + dx / distance * visual_radius
+                    visual_z[point_index] = center_z + dz / distance * visual_radius
+                else:
+                    visual_x[point_index] = center_x
+                    visual_z[point_index] = center_z
+
+            file_palette = [
+                "tab:blue", "tab:orange", "tab:green", "tab:red",
+                "tab:purple", "tab:brown", "tab:pink", "tab:gray",
+                "tab:olive", "tab:cyan",
+            ]
+            file_indices = {}
+            sources = section.get("point_sources", [])
+            for point_index, (visual_x_value, visual_z_value) in enumerate(
+                zip(visual_x, visual_z)
+            ):
+                source = sources[point_index] if point_index < len(sources) else {
+                    "file": "未知文件", "row": point_index + 1
+                }
+                file_name = source["file"]
+                if file_name not in file_indices:
+                    file_indices[file_name] = len(file_indices)
+                color = file_palette[file_indices[file_name] % len(file_palette)]
+                ax.scatter(
+                    [visual_x_value],
+                    [visual_z_value],
+                    s=42,
+                    color=color,
+                    edgecolors="black",
+                    linewidths=0.4,
+                )
+                ax.plot(
+                    [x_values[point_index], visual_x_value],
+                    [z_values[point_index], visual_z_value],
+                    color=color,
+                    alpha=0.35,
+                    linewidth=0.7,
+                )
+                ax.annotate(
+                    str(source["row"]),
+                    (visual_x_value, visual_z_value),
+                    xytext=(3, 3),
+                    textcoords="offset points",
+                    fontsize=7,
+                    color=color,
+                    weight="bold",
+                )
+
+            for file_name, file_index in file_indices.items():
+                color = file_palette[file_index % len(file_palette)]
+                ax.scatter([], [], color=color, s=20, label=os.path.basename(file_name))
+            ax.plot([], [], "k--", label=f"径向偏离放大 {exaggeration:.1f} 倍")
             ax.set_title(f"{index + 1}档：投影点与拟合圆")
             ax.set_xlabel("档位横向坐标 (mm)")
             ax.set_ylabel("档位垂直坐标 (mm)")
@@ -263,8 +338,8 @@ class CircleCenterApp:
 
         centers = data["centers"]
         for horizontal_key, title, xlabel in (
-            ("x", "水平面 XY：一档、二档、三档圆示意及圆心连线", "X (mm)"),
-            ("z", "垂直面 YZ：一档、二档、三档圆示意及圆心连线", "Z (mm)"),
+            ("x", "水平面 XY：一档、二档、三档圆投影椭圆及水平直径", "X (mm)"),
+            ("z", "垂直面 YZ：一档、二档、三档圆投影直径及圆心连线", "Z (mm)"),
         ):
             figure = Figure(figsize=(8, 7), dpi=100)
             ax = figure.add_subplot(111)
@@ -277,6 +352,7 @@ class CircleCenterApp:
                 title,
                 xlabel,
                 "Y (mm)",
+                data["tan_slope"],
             )
             self._show_plot_window(title, figure)
 
@@ -291,25 +367,66 @@ class CircleCenterApp:
 
     @staticmethod
     def _plot_center_plane(
-        ax, centers, radii, horizontal_key, vertical_key, title, xlabel, ylabel
+        ax, centers, radii, horizontal_key, vertical_key, title, xlabel, ylabel, tan_slope
     ):
-        """绘制一档、二档、三档圆示意、圆心连线及二档圆心到该线的垂线。"""
+        """绘制一档、二档、三档截面圆在水平面或垂直面的投影及直径。"""
         horizontal = np.array([center[horizontal_key] for center in centers], dtype=float)
         vertical = np.array([center[vertical_key] for center in centers], dtype=float)
         colors = ["tab:blue", "tab:orange", "tab:green"]
         for index, (x_value, y_value, radius) in enumerate(
             zip(horizontal, vertical, radii)
         ):
-            ax.add_patch(
-                matplotlib.patches.Circle(
-                    (x_value, y_value),
-                    radius,
-                    fill=False,
-                    color=colors[index],
-                    alpha=0.55,
-                    linestyle=":",
+            if horizontal_key == "x":
+                axis_norm = float(np.sqrt(1.0 + tan_slope * tan_slope))
+                projected_y_radius = radius * abs(tan_slope) / axis_norm
+                ax.add_patch(
+                    matplotlib.patches.Ellipse(
+                        (x_value, y_value),
+                        width=2.0 * radius,
+                        height=2.0 * projected_y_radius,
+                        fill=False,
+                        edgecolor=colors[index],
+                        alpha=0.55,
+                        linestyle=":",
+                        label=f"{index + 1}档拟合圆水平投影椭圆",
+                    )
                 )
-            )
+                ax.plot(
+                    [x_value - radius, x_value + radius],
+                    [y_value, y_value],
+                    color=colors[index],
+                    linewidth=1.8,
+                    label=f"{index + 1}档水平直径",
+                )
+                ax.scatter(
+                    [x_value - radius, x_value, x_value + radius],
+                    [y_value, y_value, y_value],
+                    color=colors[index],
+                    s=[28, 38, 28],
+                    zorder=4,
+                )
+            else:
+                axis_norm = float(np.sqrt(1.0 + tan_slope * tan_slope))
+                dy = -tan_slope / axis_norm
+                dz = 1.0 / axis_norm
+                start_y = y_value - radius * dy
+                end_y = y_value + radius * dy
+                start_z = x_value - radius * dz
+                end_z = x_value + radius * dz
+                ax.plot(
+                    [start_z, end_z],
+                    [start_y, end_y],
+                    color=colors[index],
+                    linewidth=1.8,
+                    label=f"{index + 1}档垂直投影直径",
+                )
+                ax.scatter(
+                    [start_z, x_value, end_z],
+                    [start_y, y_value, end_y],
+                    color=colors[index],
+                    s=[28, 38, 28],
+                    zorder=4,
+                )
         ax.plot(horizontal[[0, 2]], vertical[[0, 2]], "k--", label="一档-三档圆心连线")
         ax.plot(horizontal, vertical, "o", color="tab:blue")
         for index, (x_value, y_value) in enumerate(zip(horizontal, vertical), start=1):
@@ -333,7 +450,7 @@ class CircleCenterApp:
             # in the diagram so its direction remains visible at normal scale.
             line_length = float(np.hypot(dx, dy))
             if distance > 1e-12 and line_length > 1e-12:
-                exaggeration = min(500, max(1.0, 0.8 * line_length / distance))
+                exaggeration = min(1000, max(1.0, 0.8 * line_length / distance))
                 visual_x = foot_x + exaggeration * (horizontal[1] - foot_x)
                 visual_y = foot_y + exaggeration * (vertical[1] - foot_y)
                 ax.plot(
@@ -426,10 +543,21 @@ class CircleCenterApp:
                 raise ValueError("请先为一档、二档、三档选择数据文件")
 
             section_points = []
+            section_point_sources = []
             average_y_values = []
             insufficient_sections = []
             for i, paths in enumerate(file_paths, start=1):
-                points = np.vstack([read_section_points(path) for path in paths])
+                file_points = []
+                point_sources = []
+                for path in paths:
+                    points, row_numbers = read_section_points_with_rows(path)
+                    file_points.append(points)
+                    point_sources.extend(
+                        {"file": path, "row": int(row_number)}
+                        for row_number in row_numbers
+                    )
+                points = np.vstack(file_points)
+                section_point_sources.append(point_sources)
                 valid_count = int(points.shape[0])
                 if valid_count < 3:
                     insufficient_sections.append(f"{i}档有效数据点共 {valid_count} 个")
@@ -504,6 +632,7 @@ class CircleCenterApp:
                     "z2d": z2d,
                     "center_2d": (cu, cv, r),
                     "center_3d": center_3d,
+                    "point_sources": section_point_sources[i],
                 })
                 raw_centers.append({"x": cx, "y": y_value, "z": cz})
                 raw_radii.append(r)

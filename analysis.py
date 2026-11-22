@@ -11,6 +11,12 @@ import numpy as np
 
 def read_section_points(file_path: str) -> np.ndarray:
     """读取截面点云，统一换算为 mm 后返回 N x 3 的 XYZ 数组。"""
+    points, _ = read_section_points_with_rows(file_path)
+    return points
+
+
+def read_section_points_with_rows(file_path: str) -> tuple[np.ndarray, np.ndarray]:
+    """读取截面点云，并返回每个有效点对应的原始表格行号。"""
     base_name = os.path.basename(file_path)
     if base_name.startswith("~$"):
         raise ValueError(f"Excel 临时锁定文件不是有效数据文件: {base_name}")
@@ -38,9 +44,12 @@ def read_section_points(file_path: str) -> np.ndarray:
 
     data = df.iloc[:, :3].copy()
     data.columns = ["X", "Y", "Z"]
-    data = data.apply(pd.to_numeric, errors="coerce").dropna()
+    numeric_data = data.apply(pd.to_numeric, errors="coerce")
+    valid_mask = numeric_data.notna().all(axis=1)
+    numeric_data = numeric_data.loc[valid_mask]
+    row_numbers = np.asarray(valid_mask.index[valid_mask], dtype=int) + 1
 
-    return data[["X", "Y", "Z"]].to_numpy(dtype=float) * 1000.0
+    return numeric_data.to_numpy(dtype=float) * 1000.0, row_numbers
 
 
 def fit_circle_2d(x: np.ndarray, z: np.ndarray) -> tuple[float, float, float]:
