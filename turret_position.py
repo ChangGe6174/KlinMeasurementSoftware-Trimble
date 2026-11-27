@@ -9,6 +9,8 @@ from turret_io import read_prism_file
 
 import matplotlib
 matplotlib.use("TkAgg")
+matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS', 'DejaVu Sans']
+matplotlib.rcParams['axes.unicode_minus'] = False
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.patches import Polygon, Circle, Arc
@@ -20,6 +22,28 @@ from matplotlib.widgets import RectangleSelector
 GEAR_NAMES = {1: '一档', 2: '二档', 3: '三档'}
 SIDE_NAMES = {'L': '左', 'R': '右'}
 END_NAMES = {'H': '高', 'L': '低'}
+
+_AUTO_TARGET_MM = 400.0    # 自动适配目标显示尺寸
+
+
+def _boost_for(target, other):
+    """根据两侧偏差之比返回 target 的额外放大系数。"""
+    eps = 1e-6
+    if target < eps or other < eps or target >= other:
+        return 1.0
+    ratio = other / target
+    if ratio > 10:
+        return 5.0
+    if ratio > 5:
+        return 2.5
+    return 1.0
+
+
+def _to_10_multiple(v):
+    """返回最接近 v 的 10 的倍数（最小 10）。"""
+    rounded = int(round(v / 10.0)) * 10
+    return max(10, rounded)
+
 
 class TurretPositionWindow(tk.Toplevel):
     """托轮位置设置子窗口。"""
@@ -50,9 +74,17 @@ class TurretPositionWindow(tk.Toplevel):
 
         self.plot_mode = tk.StringVar(value="A")
 
-        self.base_y_bot_var = tk.StringVar(value="-100")
-        self.base_W_y_var = tk.StringVar(value="3000")
+        # ===== 模式 A 参数：按挡位独立 =====
+        # 窑坐标系显示值（每挡位一份）
+        self.base_y_bot_by_gear = {g: tk.StringVar(value="-100.0") for g in (1, 2, 3)}
+        self.base_W_y_by_gear = {g: tk.StringVar(value="3000") for g in (1, 2, 3)}
+        # 原始托轮坐标系（用于 offset 补偿）
+        self._base_y_bot_orig = {g: -100.0 for g in (1, 2, 3)}
+        # UI 显示变量（始终与 current_gear 对应）
+        self.base_y_bot_display = tk.StringVar(value="-100.0")
+        self.base_W_y_display = tk.StringVar(value="3000")
 
+        # 模式 B 参数（全局）
         self.l1_var = tk.StringVar(value="100")
         self.l2_var = tk.StringVar(value="100")
         self.l3_var = tk.StringVar(value="100")
@@ -65,6 +97,7 @@ class TurretPositionWindow(tk.Toplevel):
         self.mag_L_var = tk.StringVar(value="20")
         self.mag_R_var = tk.StringVar(value="20")
         self.mag_z_var = tk.StringVar(value="20")
+        self.auto_mag_var = tk.BooleanVar(value=True)
         self.view_zoom_var = tk.StringVar(value="1.0")
         self.current_gear = tk.IntVar(value=1)
         self.zoom_mode = tk.BooleanVar(value=False)
@@ -92,13 +125,32 @@ class TurretPositionWindow(tk.Toplevel):
                 except ValueError:
                     vals.append(0.0)
             self._base_points[key] = vals
-        self._base_y_bot = -100.0
 
         self.left_canvas = None
+
+        # ===== UI 双向同步 trace =====
+        # 用户编辑 base_y_bot_display → 自动更新当前挡位的 by_gear 和 orig
+        self.base_y_bot_display.trace_add('write', self._on_base_y_changed)
+        self.base_W_y_display.trace_add('write', self._on_base_W_changed)
 
         self._build_menu()
         self._build_ui()
 
+    # ==================== UI 同步回调 ====================
+    def _on_base_y_changed(self, *args):
+        g = self.current_gear.get()
+        txt = self.base_y_bot_display.get()
+        self.base_y_bot_by_gear[g].set(txt)
+        try:
+            self._base_y_bot_orig[g] = float(txt) - self.coord_offset[1]
+        except ValueError:
+            pass
+
+    def _on_base_W_changed(self, *args):
+        g = self.current_gear.get()
+        self.base_W_y_by_gear[g].set(self.base_W_y_display.get())
+
+    # ==================== 菜单 ====================
     def _build_menu(self):
         menubar = tk.Menu(self)
         measure_menu = tk.Menu(menubar, tearoff=0)
@@ -107,6 +159,7 @@ class TurretPositionWindow(tk.Toplevel):
         menubar.add_cascade(label="测量", menu=measure_menu)
         self.config(menu=menubar)
 
+    # ==================== base ↔ 显示 同步 ====================
     def _sync_display_to_base(self):
         for key in self.point_vars:
             for i in (0, 1, 2):
@@ -115,8 +168,11 @@ class TurretPositionWindow(tk.Toplevel):
                     self._base_points[key][i] = display_val - self.coord_offset[i]
                 except ValueError:
                     pass
+        # 当前挡位基座 y
+        g = self.current_gear.get()
         try:
-            self._base_y_bot = float(self.base_y_bot_var.get()) - self.coord_offset[1]
+            display_val = float(self.base_y_bot_display.get())
+            self._base_y_bot_orig[g] = display_val - self.coord_offset[1]
         except ValueError:
             pass
 
@@ -125,8 +181,14 @@ class TurretPositionWindow(tk.Toplevel):
             for i in (0, 1, 2):
                 val = self._base_points[key][i] + self.coord_offset[i]
                 self.point_vars[key][i].set(f"{val:.4f}")
-        self.base_y_bot_var.set(f"{self._base_y_bot + self.coord_offset[1]:.4f}")
+        # 所有挡位基座 y 显示值 = 原始 + offset
+        for g in (1, 2, 3):
+            self.base_y_bot_by_gear[g].set(
+                f"{self._base_y_bot_orig[g] + self.coord_offset[1]:.4f}")
+        cur = self.current_gear.get()
+        self.base_y_bot_display.set(self.base_y_bot_by_gear[cur].get())
 
+    # ==================== UI ====================
     def _build_ui(self):
         paned = ttk.PanedWindow(self, orient="horizontal")
         paned.pack(fill="both", expand=True, padx=8, pady=8)
@@ -194,13 +256,14 @@ class TurretPositionWindow(tk.Toplevel):
         except Exception:
             pass
 
+    # ==================== 左侧内容 ====================
     def _build_left(self, parent):
         gear_frame = ttk.LabelFrame(parent, text="显示挡位")
         gear_frame.pack(fill="x", padx=4, pady=4)
         for g in (1, 2, 3):
             ttk.Radiobutton(gear_frame, text=GEAR_NAMES[g], value=g,
                             variable=self.current_gear,
-                            command=self.plot).pack(side="left", padx=12, pady=4)
+                            command=self._on_gear_change).pack(side="left", padx=12, pady=4)
 
         frame = ttk.LabelFrame(parent, text="托轮轴端坐标 (mm)")
         frame.pack(fill="x", padx=4, pady=4)
@@ -230,18 +293,19 @@ class TurretPositionWindow(tk.Toplevel):
                         value="B", variable=self.plot_mode,
                         command=self._on_mode_change).pack(anchor="w", padx=6, pady=2)
 
-        self.frame_mode_A = ttk.LabelFrame(parent, text="模式 A 参数 (mm)")
+        # ===== 模式 A：按挡位独立 =====
+        self.frame_mode_A = ttk.LabelFrame(parent, text="模式 A 参数 (mm) — 当前挡位独立")
         self.frame_mode_A.pack(fill="x", padx=4, pady=4)
         ttk.Label(self.frame_mode_A, text="基座下边缘 y:").grid(
             row=0, column=0, sticky="e", padx=4, pady=2)
-        ttk.Entry(self.frame_mode_A, textvariable=self.base_y_bot_var, width=12).grid(
+        ttk.Entry(self.frame_mode_A, textvariable=self.base_y_bot_display, width=12).grid(
             row=0, column=1, padx=4, pady=2)
         ttk.Label(self.frame_mode_A, text="基座 y 向宽度:").grid(
             row=1, column=0, sticky="e", padx=4, pady=2)
-        ttk.Entry(self.frame_mode_A, textvariable=self.base_W_y_var, width=12).grid(
+        ttk.Entry(self.frame_mode_A, textvariable=self.base_W_y_display, width=12).grid(
             row=1, column=1, padx=4, pady=2)
         ttk.Label(self.frame_mode_A,
-                  text="基座 y 范围 = [下边缘y, 下边缘y + 宽度]\n"
+                  text="切换挡位时自动加载该挡位对应的值（各挡位独立）。\n"
                        "x 向宽度自动取覆盖两条基准线，l1~l4 自动计算。",
                   foreground="#666", font=("", 8), justify="left").grid(
             row=2, column=0, columnspan=2, padx=4, pady=(2, 4), sticky="w")
@@ -290,13 +354,17 @@ class TurretPositionWindow(tk.Toplevel):
             row=5, column=0, sticky="e", padx=4, pady=3)
         ttk.Entry(param, textvariable=self.mag_z_var, width=12).grid(
             row=5, column=1, padx=4, pady=3)
+        ttk.Checkbutton(param,
+                        text=f"自动适配放大倍数（跨三挡位统一取最大，以最大偏差≈{_AUTO_TARGET_MM:.0f}mm 为目标）",
+                        variable=self.auto_mag_var).grid(
+            row=6, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 4))
         ttk.Label(param, text="矩形旋转方向:").grid(
-            row=6, column=0, sticky="e", padx=4, pady=3)
+            row=7, column=0, sticky="e", padx=4, pady=3)
         ttk.Combobox(param, textvariable=self.rotate_dir_var,
                      values=["顺时针", "逆时针"], state="readonly", width=10).grid(
-            row=6, column=1, padx=4, pady=3, sticky="w")
+            row=7, column=1, padx=4, pady=3, sticky="w")
         ttk.Button(param, text="绘制当前挡位", command=self.plot).grid(
-            row=7, column=0, columnspan=2, pady=8, padx=4, sticky="ew")
+            row=8, column=0, columnspan=2, pady=8, padx=4, sticky="ew")
 
         zoom_frame = ttk.LabelFrame(parent, text="视图缩放控制")
         zoom_frame.pack(fill="x", padx=4, pady=4)
@@ -314,7 +382,7 @@ class TurretPositionWindow(tk.Toplevel):
 
         sum_frame = ttk.LabelFrame(parent, text="偏差摘要")
         sum_frame.pack(fill="both", expand=True, padx=4, pady=(4, 12))
-        self.txt_summary = tk.Text(sum_frame, height=14, width=50,
+        self.txt_summary = tk.Text(sum_frame, height=18, width=50,
                                    font=("Consolas", 9), state="disabled")
         self.txt_summary.pack(fill="both", expand=True, padx=2, pady=2)
 
@@ -327,6 +395,13 @@ class TurretPositionWindow(tk.Toplevel):
         else:
             self.frame_mode_A.pack_forget()
             self.frame_mode_B.pack(fill="x", padx=4, pady=4)
+
+    def _on_gear_change(self):
+        """切换挡位：加载该挡位的基座参数并重绘。"""
+        g = self.current_gear.get()
+        self.base_y_bot_display.set(self.base_y_bot_by_gear[g].get())
+        self.base_W_y_display.set(self.base_W_y_by_gear[g].get())
+        self.plot()
 
     def _build_right(self, parent):
         self.fig = Figure(figsize=(9, 8), dpi=100)
@@ -348,7 +423,7 @@ class TurretPositionWindow(tk.Toplevel):
         self.rs.set_active(False)
         self.canvas.draw()
 
-    # ---------------- 坐标系偏移 ----------------
+    # ==================== 坐标系偏移 ====================
     def open_coord_offset_dialog(self):
         dlg = tk.Toplevel(self)
         dlg.title("坐标系位移")
@@ -360,7 +435,7 @@ class TurretPositionWindow(tk.Toplevel):
                   text=("输入相对【原始托轮坐标系】的目标偏移 (dx, dy, dz)，\n"
                         "窑坐标系 = 原始托轮坐标 + 偏移。\n"
                         "每次应用均为绝对偏移值，不会与前一次累加。\n"
-                        "基准线位置也会同步平移。"),
+                        "基准线位置、所有挡位基座 y 均同步平移。"),
                   justify="left", foreground="#444").pack(padx=12, pady=8, anchor="w")
 
         frame = ttk.Frame(dlg)
@@ -374,13 +449,6 @@ class TurretPositionWindow(tk.Toplevel):
         ttk.Label(frame, text="dz (mm):").grid(row=2, column=0, sticky="e", padx=4, pady=3)
         var_dz = tk.StringVar(value=f"{self.coord_offset[2]:.2f}")
         ttk.Entry(frame, textvariable=var_dz, width=14).grid(row=2, column=1, padx=4, pady=3)
-
-        info_lbl = tk.Label(dlg, text=f"当前偏移: "
-                                      f"dx={self.coord_offset[0]:.2f}, "
-                                      f"dy={self.coord_offset[1]:.2f}, "
-                                      f"dz={self.coord_offset[2]:.2f}",
-                            fg="#1f5fa8", font=("", 9, "bold"))
-        info_lbl.pack(padx=12, pady=4, anchor="w")
 
         ttk.Label(dlg, text="提示：清零请输入 (0, 0, 0)。",
                   foreground="#666").pack(padx=12, pady=(2, 0), anchor="w")
@@ -404,7 +472,7 @@ class TurretPositionWindow(tk.Toplevel):
         ttk.Button(btns, text="应用", command=on_apply, width=10).pack(side="left", padx=6)
         ttk.Button(btns, text="取消", command=dlg.destroy, width=10).pack(side="left", padx=6)
 
-    # ---------------- 棱镜文件解析 ----------------
+    # ==================== 棱镜文件解析 ====================
     def _read_prism_file(self, path):
         return read_prism_file(path)
 
@@ -421,40 +489,21 @@ class TurretPositionWindow(tk.Toplevel):
         except Exception as e:
             messagebox.showerror("读取失败", f"{e}")
             return
-
         if not rows:
-            messagebox.showwarning(
-                "无有效数据",
-                "文件中未找到有效坐标。\n\n"
-                "支持的格式：\n"
-                "  A. 轴标签矩阵（推荐）\n"
-                "       X  1.5372  1.5368  1.5365  ...\n"
-                "       Y  0.3062  0.3074  0.3069  ...\n"
-                "       Z  0.6838  0.6843  0.6853  ...\n"
-                "  B. 横向：每行 x y z\n"
-                "  C. 纵向：一列数字，前 1/3 为 x、中 1/3 为 y、后 1/3 为 z\n"
-                "  · 原始单位按米处理，导入后自动 ×1000 转毫米")
+            messagebox.showwarning("无有效数据", "文件中未找到有效坐标。")
             return
-
         n = len(rows)
         mx = sum(r[0] for r in rows) / n
         my = sum(r[1] for r in rows) / n
         mz = sum(r[2] for r in rows) / n
-
         target_vars[0].set(f"{mx:.4f}")
         target_vars[1].set(f"{my:.4f}")
         target_vars[2].set(f"{mz:.4f}")
+        messagebox.showinfo("导入完成",
+            f"{target_label} 已导入 {n} 条数据（米→毫米）\n\n"
+            f"平均值：x̄={mx:.4f}  ȳ={my:.4f}  z̄={mz:.4f}")
 
-        messagebox.showinfo(
-            "导入完成",
-            f"{target_label} 已导入 {n} 条数据\n"
-            f"（原始单位：米，已转为毫米）\n\n"
-            f"算术平均值：\n"
-            f"  x̄ = {mx:.4f} mm\n"
-            f"  ȳ = {my:.4f} mm\n"
-            f"  z̄ = {mz:.4f} mm")
-
-    # ---------------- 棱镜位置解算 ----------------
+    # ==================== 棱镜位置解算 ====================
     def open_prism_dialog(self):
         dlg = tk.Toplevel(self)
         dlg.title("棱镜位置解算")
@@ -468,8 +517,6 @@ class TurretPositionWindow(tk.Toplevel):
         header.pack(fill="x", padx=12, pady=8)
         ttk.Label(header, text=f"当前挡位：{GEAR_NAMES[gear]}",
                   font=("", 11, "bold")).pack(side="left")
-        ttk.Label(header, text="  （左右两侧独立填写棱镜坐标及到端面距离）",
-                  foreground="#666", font=("", 9)).pack(side="left")
 
         input_vars = {}
 
@@ -486,14 +533,13 @@ class TurretPositionWindow(tk.Toplevel):
                 vars_triple.append(var)
                 ttk.Entry(row, textvariable=var, width=11).pack(side="left", padx=2)
             ttk.Button(row, text="导入...", width=8,
-                       command=lambda tv=vars_triple,
-                                      lbl=label_text: self._import_prism_file(tv, lbl)
+                       command=lambda tv=vars_triple, lbl=label_text:
+                           self._import_prism_file(tv, lbl)
                        ).pack(side="left", padx=(10, 0))
 
         for side in ('L', 'R'):
             frame = ttk.LabelFrame(dlg, text=f"{SIDE_NAMES[side]}托轮")
             frame.pack(fill="x", padx=12, pady=6)
-
             build_prism_row(frame, "高端棱镜:", side + 'H')
             build_prism_row(frame, "低端棱镜:", side + 'L')
 
@@ -513,23 +559,15 @@ class TurretPositionWindow(tk.Toplevel):
 
         note_text = (
             "解算说明:\n"
-            "  设高端棱镜 P_H、低端棱镜 P_L，单位方向向量 u = (P_L − P_H) / |P_L − P_H|\n"
-            "  托轮轴高端  Q_H = P_H + d_H·u   (从高端棱镜向低端方向偏移 d_H)\n"
-            "  托轮轴低端  Q_L = P_L − d_L·u   (从低端棱镜向高端方向偏移 d_L)\n"
-            "  输入为【原始托轮坐标系】下的棱镜坐标，解算结果也作为原始坐标保存。\n\n"
-            "文件导入支持的三种布局:\n"
-            "  A. 轴标签矩阵（推荐）\n"
-            "       X  1.5372  1.5368  1.5365  ...\n"
-            "       Y  0.3062  0.3074  0.3069  ...\n"
-            "       Z  0.6838  0.6843  0.6853  ...\n"
+            "  设高端棱镜 P_H、低端棱镜 P_L，方向 u = (P_L − P_H) / |P_L − P_H|\n"
+            "  Q_H = P_H + d_H·u ；Q_L = P_L − d_L·u\n\n"
+            "文件导入支持（米 → 毫米）：\n"
+            "  A. 轴标签矩阵：X / Y / Z 各一行，行尾 N 个数值\n"
             "  B. 横向：每行 x y z\n"
             "  C. 纵向：一列数字，前 1/3 为 x、中 1/3 为 y、后 1/3 为 z\n"
-            "  · 文件原始单位为米，导入后自动 ×1000 转毫米后求平均\n"
-            "  · 每行【导入...】按钮只作用于对应棱镜，不影响其他棱镜"
         )
-        ttk.Label(dlg, text=note_text,
-                  foreground="#444", font=("Consolas", 9), justify="left").pack(
-            fill="x", padx=14, pady=8)
+        ttk.Label(dlg, text=note_text, foreground="#444",
+                  font=("Consolas", 9), justify="left").pack(fill="x", padx=14, pady=8)
 
         if gear in self.prism_data:
             for key, var in input_vars.items():
@@ -551,25 +589,20 @@ class TurretPositionWindow(tk.Toplevel):
                     dx, dy, dz = Lx - Hx, Ly - Hy, Lz - Hz
                     norm = math.sqrt(dx * dx + dy * dy + dz * dz)
                     if norm < 1e-9:
-                        messagebox.showerror("错误",
-                                             f"{SIDE_NAMES[side]}托轮的高低端棱镜重合",
-                                             parent=dlg)
+                        messagebox.showerror("错误", f"{SIDE_NAMES[side]}高低端棱镜重合", parent=dlg)
                         return
                     ux, uy, uz = dx / norm, dy / norm, dz / norm
-                    Qx_H = Hx + dH * ux; Qy_H = Hy + dH * uy; Qz_H = Hz + dH * uz
-                    Qx_L = Lx - dL * ux; Qy_L = Ly - dL * uy; Qz_L = Lz - dL * uz
-                    results[side] = ((Qx_H, Qy_H, Qz_H), (Qx_L, Qy_L, Qz_L))
-
+                    results[side] = (
+                        (Hx + dH * ux, Hy + dH * uy, Hz + dH * uz),
+                        (Lx - dL * ux, Ly - dL * uy, Lz - dL * uz),
+                    )
                 for side in ('L', 'R'):
-                    (Qx_H, Qy_H, Qz_H), (Qx_L, Qy_L, Qz_L) = results[side]
-                    self._base_points[(gear, side, 'H')] = [Qx_H, Qy_H, Qz_H]
-                    self._base_points[(gear, side, 'L')] = [Qx_L, Qy_L, Qz_L]
-
+                    (QxH, QyH, QzH), (QxL, QyL, QzL) = results[side]
+                    self._base_points[(gear, side, 'H')] = [QxH, QyH, QzH]
+                    self._base_points[(gear, side, 'L')] = [QxL, QyL, QzL]
                 self._refresh_display_from_base()
                 self.prism_data[gear] = {k: v.get() for k, v in input_vars.items()}
-                messagebox.showinfo("完成",
-                                    f"已解算并填入{GEAR_NAMES[gear]}的托轮轴高端/低端坐标",
-                                    parent=dlg)
+                messagebox.showinfo("完成", f"已解算并填入{GEAR_NAMES[gear]}轴端坐标", parent=dlg)
                 dlg.destroy()
                 self.plot()
             except ValueError:
@@ -579,13 +612,10 @@ class TurretPositionWindow(tk.Toplevel):
         ttk.Button(btns, text="计算并填入", command=on_calc, width=14).pack(side="left", padx=6)
         ttk.Button(btns, text="关闭", command=dlg.destroy, width=10).pack(side="left", padx=6)
 
-    # ---------------- 缩放控制 ----------------
+    # ==================== 缩放控制 ====================
     def toggle_zoom_mode(self):
         self.rs.set_active(self.zoom_mode.get())
-        if self.zoom_mode.get():
-            self.ax.set_title("框选放大模式：请按住鼠标左键框选区域")
-        else:
-            self.ax.set_title("拖拽模式：请按住鼠标左键拖动文字或线条")
+        self.ax.set_title("框选放大模式" if self.zoom_mode.get() else "拖拽模式")
         self.canvas.draw_idle()
 
     def on_select(self, eclick, erelease):
@@ -604,7 +634,7 @@ class TurretPositionWindow(tk.Toplevel):
         self.view_zoom_var.set("1.0")
         self.plot()
 
-    # ---------------- 拖拽事件 ----------------
+    # ==================== 拖拽事件 ====================
     def on_press(self, event):
         if self.zoom_mode.get() or event.inaxes != self.ax:
             return
@@ -615,7 +645,6 @@ class TurretPositionWindow(tk.Toplevel):
                 artists = group['artists']
             else:
                 artists = []
-
             for artist in artists:
                 contains, _ = artist.contains(event)
                 if contains:
@@ -636,9 +665,7 @@ class TurretPositionWindow(tk.Toplevel):
                             elif isinstance(a, Circle):
                                 self.start_data.append(a.center)
                             elif isinstance(a, Arc):
-                                ctr = getattr(a, 'center', None)
-                                if ctr is None:
-                                    ctr = getattr(a, '_center', (0.0, 0.0))
+                                ctr = getattr(a, 'center', None) or getattr(a, '_center', (0.0, 0.0))
                                 self.start_data.append((float(ctr[0]), float(ctr[1])))
                             elif isinstance(a, Polygon):
                                 verts = a.get_xy()
@@ -667,7 +694,6 @@ class TurretPositionWindow(tk.Toplevel):
                 arr.xy = (x2, y_line); arr.set_position((x1, y_line))
             group['t'].set_position(((x1 + x2) / 2, y_line + 50))
             group['temp_offset'] = new_offset
-
         elif group['type'] == 'dim_v':
             new_offset = self.start_offset + dx
             x_line = group['x_ref'] + new_offset
@@ -680,7 +706,6 @@ class TurretPositionWindow(tk.Toplevel):
                 arr.xy = (x_line, y2); arr.set_position((x_line, y1))
             group['t'].set_position((x_line + 50, (y1 + y2) / 2))
             group['temp_offset'] = new_offset
-
         elif group['type'] == 'group':
             artists = group['artists']
             for i, a in enumerate(artists):
@@ -706,7 +731,6 @@ class TurretPositionWindow(tk.Toplevel):
                 elif isinstance(a, Polygon):
                     verts = self.start_data[i]
                     a.set_xy([(v[0] + dx, v[1] + dy) for v in verts])
-
         self.canvas.draw_idle()
 
     def on_release(self, event):
@@ -716,7 +740,7 @@ class TurretPositionWindow(tk.Toplevel):
         self.active_group = None
         self.start_data = []
 
-    # ---------------- 尺寸标注函数 ----------------
+    # ==================== 尺寸标注函数 ====================
     def _draw_horizontal_dim(self, x1, x2, y_ref, text, offset_y, key, y1=None, y2=None):
         if y1 is None: y1 = y_ref
         if y2 is None: y2 = y_ref
@@ -764,9 +788,8 @@ class TurretPositionWindow(tk.Toplevel):
         arc = Arc((cx, cy), 2 * r_arrow, 2 * r_arrow, angle=0,
                   theta1=130, theta2=410, color='black', lw=0.9, zorder=11, picker=5)
         self.ax.add_patch(arc)
-        arrow_head_deg = 270
-        tangent_deg = 180 if is_cw else 0
-        head_rad = math.radians(arrow_head_deg); tan_rad = math.radians(tangent_deg)
+        head_rad = math.radians(270)
+        tan_rad = math.radians(180 if is_cw else 0)
         tip_x = cx + r_arrow * math.cos(head_rad)
         tip_y = cy + r_arrow * math.sin(head_rad)
         arrow_len = max(r_arrow * 0.35, 30)
@@ -783,7 +806,7 @@ class TurretPositionWindow(tk.Toplevel):
         self.ax.add_patch(arrow_tri)
         return {'type': 'group', 'artists': [gear_text, arc, arrow_tri]}
 
-    # ---------------- 数据读取 ----------------
+    # ==================== 数据读取 ====================
     def _read_params(self):
         try:
             base1_x = float(self.base1_x_var.get())
@@ -793,16 +816,14 @@ class TurretPositionWindow(tk.Toplevel):
             mag_R = float(self.mag_R_var.get())
             mag_z = float(self.mag_z_var.get())
             if self.plot_mode.get() == "A":
-                y_bot = float(self.base_y_bot_var.get())
-                W_y = float(self.base_W_y_var.get())
+                y_bot = float(self.base_y_bot_display.get())
+                W_y = float(self.base_W_y_display.get())
                 if m < 0 or mag_L < 1 or mag_R < 1 or mag_z < 1 or W_y <= 0:
                     raise ValueError
                 return ('A', base1_x, X, m, mag_L, mag_R, mag_z, y_bot, W_y)
             else:
-                l1 = float(self.l1_var.get())
-                l2 = float(self.l2_var.get())
-                l3 = float(self.l3_var.get())
-                l4 = float(self.l4_var.get())
+                l1 = float(self.l1_var.get()); l2 = float(self.l2_var.get())
+                l3 = float(self.l3_var.get()); l4 = float(self.l4_var.get())
                 if m < 0 or mag_L < 1 or mag_R < 1 or mag_z < 1:
                     raise ValueError
                 return ('B', base1_x, X, m, mag_L, mag_R, mag_z, l1, l2, l3, l4)
@@ -821,13 +842,106 @@ class TurretPositionWindow(tk.Toplevel):
                 return None
         return pts
 
-    # ---------------- 偏差摘要 ----------------
+    # ==================== 逐挡位偏差 + 统一放大 ====================
+    @staticmethod
+    def _intersect_xy_z(h_pt, l_pt, k_e, b_e):
+        hx, hy, hz = h_pt[0], h_pt[1], h_pt[2]
+        lx, ly, lz = l_pt[0], l_pt[1], l_pt[2]
+        denom = (hy - ly) - k_e * (hx - lx)
+        t = 1.0 if abs(denom) < 1e-9 else (k_e * lx + b_e - ly) / denom
+        return (lx + t * (hx - lx), ly + t * (hy - ly), lz + t * (hz - lz))
+
+    def _compute_gear_deviation(self, gear, mode, params, pts):
+        """返回 (max_dx, max_dz)，对指定挡位计算。
+        坐标全 0 视为无效 → (0,0)。"""
+        hL = pts[(gear, 'L', 'H')]
+        lL = pts[(gear, 'L', 'L')]
+        hR = pts[(gear, 'R', 'H')]
+        lR = pts[(gear, 'R', 'L')]
+        all_coords = [hL, lL, hR, lR]
+        if all(all(abs(v) < 1e-9 for v in p) for p in all_coords):
+            return 0.0, 0.0
+
+        if mode == "A":
+            try:
+                y_bot = float(self.base_y_bot_by_gear[gear].get())
+                W_y = float(self.base_W_y_by_gear[gear].get())
+            except ValueError:
+                return 0.0, 0.0
+            y_top = y_bot + W_y
+            k_hi, b_hi = 0.0, y_top
+            k_lo, b_lo = 0.0, y_bot
+        else:
+            l1_in, l2_in, l3_in, l4_in = params[7], params[8], params[9], params[10]
+            h_y_avg = (hL[1] + hR[1]) / 2
+            l_y_avg = (lL[1] + lR[1]) / 2
+            if h_y_avg > l_y_avg:
+                y_hi_L = hL[1] - l1_in; y_hi_R = hR[1] - l2_in
+                y_lo_L = lL[1] + l3_in; y_lo_R = lR[1] + l4_in
+            else:
+                y_hi_L = hL[1] + l1_in; y_hi_R = hR[1] + l2_in
+                y_lo_L = lL[1] - l3_in; y_lo_R = lR[1] - l4_in
+            if abs(hR[0] - hL[0]) > 1e-6:
+                k_hi = (y_hi_R - y_hi_L) / (hR[0] - hL[0])
+                b_hi = y_hi_L - k_hi * hL[0]
+            else:
+                k_hi, b_hi = 0.0, y_hi_L
+            if abs(lR[0] - lL[0]) > 1e-6:
+                k_lo = (y_lo_R - y_lo_L) / (lR[0] - lL[0])
+                b_lo = y_lo_L - k_lo * lL[0]
+            else:
+                k_lo, b_lo = 0.0, y_lo_L
+
+        aL = self._intersect_xy_z(hL, lL, k_hi, b_hi)
+        aR = self._intersect_xy_z(hR, lR, k_hi, b_hi)
+        bL = self._intersect_xy_z(hL, lL, k_lo, b_lo)
+        bR = self._intersect_xy_z(hR, lR, k_lo, b_lo)
+
+        dx_L = abs(hL[0] - lL[0])
+        dx_R = abs(hR[0] - lR[0])
+        dz_za = abs(aL[2] - aR[2])
+        dz_zb = abs(bL[2] - bR[2])
+        return max(dx_L, dx_R), max(dz_za, dz_zb)
+
+    def _compute_unified_mags(self, mode, params, pts):
+        """跨三挡位统一：对每挡位算建议倍数（10 的倍数），取最大值。
+        返回 (mag_LR, mag_Z, gear_mag_info)；
+        gear_mag_info = {g: (lr_g 或 None, z_g 或 None)}"""
+        mag_LR_cands = []
+        mag_Z_cands = []
+        gear_mag_info = {}
+        for g in (1, 2, 3):
+            dx_g, dz_g = self._compute_gear_deviation(g, mode, params, pts)
+            lr_g = _to_10_multiple(_AUTO_TARGET_MM / dx_g) if dx_g > 1e-6 else None
+            z_g = _to_10_multiple(_AUTO_TARGET_MM / dz_g) if dz_g > 1e-6 else None
+            gear_mag_info[g] = (lr_g, z_g)
+            if lr_g is not None:
+                mag_LR_cands.append(lr_g)
+            if z_g is not None:
+                mag_Z_cands.append(z_g)
+        mag_LR = max(mag_LR_cands) if mag_LR_cands else 20
+        mag_Z = max(mag_Z_cands) if mag_Z_cands else 20
+        return mag_LR, mag_Z, gear_mag_info
+
+    # ==================== 偏差摘要 ====================
     def _update_summary(self, mode, gear, pts, X, m, mag_L, mag_R, mag_z,
-                        base_info, z_info, line1_x_abs):
+                        base_info, z_info, line1_x_abs,
+                        boost_L, boost_R, boost_za, boost_zb,
+                        auto_applied, gear_mag_info):
         lines = [f"{GEAR_NAMES[gear]}托轮偏差摘要  [模式 {mode}]", "=" * 44, ""]
         if mag_L > 1 or mag_R > 1 or mag_z > 1:
             lines.append(f"⚠ 倾斜放大(L:{mag_L}/R:{mag_R})，Z向放大:{mag_z}倍")
-            lines.append("")
+        if auto_applied and gear_mag_info:
+            lines.append("自动适配（跨三挡位统一取最大，10 的倍数）：")
+            for g in (1, 2, 3):
+                lr_g, z_g = gear_mag_info.get(g, (None, None))
+                lr_txt = f"{lr_g}" if lr_g is not None else "—"
+                z_txt = f"{z_g}" if z_g is not None else "—"
+                lines.append(f"  {GEAR_NAMES[g]}：倾斜需 {lr_txt}，Z 需 {z_txt}")
+            lines.append(f"  → 统一倾斜 = {mag_L}，统一 Z = {mag_z}")
+        lines.append(f"  差异放大系数：L×{boost_L:.1f}  R×{boost_R:.1f}  "
+                     f"上边缘×{boost_za:.1f}  下边缘×{boost_zb:.1f}")
+        lines.append("")
 
         line2_x_abs = line1_x_abs + X
         lines.append(f"基准线 1 x = {line1_x_abs:.2f}，基准线 2 x = {line2_x_abs:.2f}，间距 = {X:.2f}")
@@ -854,12 +968,9 @@ class TurretPositionWindow(tk.Toplevel):
                 d_lo = abs(z_info[side]['x_lo'] - base_x)
             else:
                 d_hi = d_lo = dx_new = 0.0
-
-            dz_true = abs(h[2] - l[2])
-            dy_true = abs(h[1] - l[1])
+            dz_true = abs(h[2] - l[2]); dy_true = abs(h[1] - l[1])
             tan_val = (dz_true / dy_true * 100) if dy_true > 1e-6 else 0.0
             theta_deg_true = math.degrees(math.atan(tan_val / 100.0))
-
             lines.append(f"{SIDE_NAMES[side]}托轮:")
             lines.append(f"  端点计算 tanθ = {tan_val:.4f} %  (θ ≈ {theta_deg_true:.4f}°)")
             lines.append(f"  上边缘交点 a 距基准线 = {d_hi:.2f} mm")
@@ -867,23 +978,19 @@ class TurretPositionWindow(tk.Toplevel):
             lines.append(f"  水平偏差 = |x_a - x_b| = {dx_new:.2f} mm")
 
         if 'L' in z_info and 'R' in z_info:
-            z_top_L = z_info['L']['z_top']
-            z_top_R = z_info['R']['z_top']
-            z_bot_L = z_info['L']['z_bot']
-            z_bot_R = z_info['R']['z_bot']
+            z_top_L = z_info['L']['z_top']; z_top_R = z_info['R']['z_top']
+            z_bot_L = z_info['L']['z_bot']; z_bot_R = z_info['R']['z_bot']
             lines.append("")
             lines.append("Z 向高差 (右 - 左)，由 a/b 交点 z 坐标求得:")
-            lines.append(f"  a 点（上边缘交点）: za_R - za_L = {z_top_R - z_top_L:+.2f} mm")
-            lines.append(f"    za_L = {z_top_L:.2f}, za_R = {z_top_R:.2f}")
-            lines.append(f"  b 点（下边缘交点）: zb_R - zb_L = {z_bot_R - z_bot_L:+.2f} mm")
-            lines.append(f"    zb_L = {z_bot_L:.2f}, zb_R = {z_bot_R:.2f}")
+            lines.append(f"  a 点：za_R - za_L = {z_top_R - z_top_L:+.2f} mm")
+            lines.append(f"  b 点：zb_R - zb_L = {z_bot_R - z_bot_L:+.2f} mm")
 
         self.txt_summary.config(state="normal")
         self.txt_summary.delete("1.0", "end")
         self.txt_summary.insert("1.0", "\n".join(lines))
         self.txt_summary.config(state="disabled")
 
-    # ---------------- 绘图主函数 ----------------
+    # ==================== 绘图主函数 ====================
     def plot(self):
         self._sync_display_to_base()
 
@@ -902,6 +1009,68 @@ class TurretPositionWindow(tk.Toplevel):
         if pts is None:
             return
         gear = self.current_gear.get()
+
+        # ===== 当前挡位基座几何（提前算，用于差异 boost）=====
+        if mode == "A":
+            y_bot_pre = params[7]
+            W_y_pre = params[8]
+            y_top_pre = y_bot_pre + W_y_pre
+            k_hi, b_hi = 0.0, y_top_pre
+            k_lo, b_lo = 0.0, y_bot_pre
+        else:
+            l1_pre, l2_pre, l3_pre, l4_pre = params[7], params[8], params[9], params[10]
+            hL_ = pts[(gear, 'L', 'H')]; lL_ = pts[(gear, 'L', 'L')]
+            hR_ = pts[(gear, 'R', 'H')]; lR_ = pts[(gear, 'R', 'L')]
+            h_y_avg = (hL_[1] + hR_[1]) / 2
+            l_y_avg = (lL_[1] + lR_[1]) / 2
+            if h_y_avg > l_y_avg:
+                y_hi_L = hL_[1] - l1_pre; y_hi_R = hR_[1] - l2_pre
+                y_lo_L = lL_[1] + l3_pre; y_lo_R = lR_[1] + l4_pre
+            else:
+                y_hi_L = hL_[1] + l1_pre; y_hi_R = hR_[1] + l2_pre
+                y_lo_L = lL_[1] - l3_pre; y_lo_R = lR_[1] - l4_pre
+            if abs(hR_[0] - hL_[0]) > 1e-6:
+                k_hi = (y_hi_R - y_hi_L) / (hR_[0] - hL_[0]); b_hi = y_hi_L - k_hi * hL_[0]
+            else:
+                k_hi, b_hi = 0.0, y_hi_L
+            if abs(lR_[0] - lL_[0]) > 1e-6:
+                k_lo = (y_lo_R - y_lo_L) / (lR_[0] - lL_[0]); b_lo = y_lo_L - k_lo * lL_[0]
+            else:
+                k_lo, b_lo = 0.0, y_lo_L
+
+        hL = pts[(gear, 'L', 'H')]; lL = pts[(gear, 'L', 'L')]
+        hR = pts[(gear, 'R', 'H')]; lR = pts[(gear, 'R', 'L')]
+        aL_pre = self._intersect_xy_z(hL, lL, k_hi, b_hi)
+        aR_pre = self._intersect_xy_z(hR, lR, k_hi, b_hi)
+        bL_pre = self._intersect_xy_z(hL, lL, k_lo, b_lo)
+        bR_pre = self._intersect_xy_z(hR, lR, k_lo, b_lo)
+
+        dx_L = abs(hL[0] - lL[0]); dx_R = abs(hR[0] - lR[0])
+        dz_za = abs(aL_pre[2] - aR_pre[2]); dz_zb = abs(bL_pre[2] - bR_pre[2])
+
+        # ===== 自动适配：跨三挡位统一取最大 =====
+        auto_applied = False
+        gear_mag_info = None
+        if self.auto_mag_var.get():
+            mag_LR, mag_Z, gear_mag_info = self._compute_unified_mags(mode, params, pts)
+            mag_L = mag_LR
+            mag_R = mag_LR
+            mag_z = mag_Z
+            self.mag_L_var.set(str(mag_L))
+            self.mag_R_var.set(str(mag_R))
+            self.mag_z_var.set(str(mag_z))
+            auto_applied = True
+
+        # ===== 差异放大系数 =====
+        boost_L = _boost_for(dx_L, dx_R)
+        boost_R = _boost_for(dx_R, dx_L)
+        boost_za = _boost_for(dz_za, dz_zb)
+        boost_zb = _boost_for(dz_zb, dz_za)
+
+        mag_L_eff = mag_L * boost_L
+        mag_R_eff = mag_R * boost_R
+        mag_za_eff = mag_z * boost_za
+        mag_zb_eff = mag_z * boost_zb
 
         ax = self.ax
         ax.clear()
@@ -929,133 +1098,99 @@ class TurretPositionWindow(tk.Toplevel):
                                           f"{abs(X):.1f}", 300, 'base_X')
             self.draggable_groups.append(g)
 
-        hL, lL = pts[(gear, 'L', 'H')], pts[(gear, 'L', 'L')]
-        hR, lR = pts[(gear, 'R', 'H')], pts[(gear, 'R', 'L')]
-
         x_min_line = min(line1_x_abs, line2_x_abs)
         x_max_line = max(line1_x_abs, line2_x_abs)
 
         if mode == "A":
-            y_bot = params[7]
-            W_y = params[8]
+            y_bot = params[7]; W_y = params[8]
             y_top = y_bot + W_y
-            x_left = x_min_line - m
-            x_right = x_max_line + m
-            k_hi, b_hi = 0.0, y_top
-            k_lo, b_lo = 0.0, y_bot
+            x_left = x_min_line - m; x_right = x_max_line + m
             l1_calc = abs(hL[1] - y_top); l2_calc = abs(hR[1] - y_top)
             l3_calc = abs(lL[1] - y_bot); l4_calc = abs(lR[1] - y_bot)
             base_info = {'l1': l1_calc, 'l2': l2_calc, 'l3': l3_calc, 'l4': l4_calc,
                          'y_bot': y_bot, 'y_top': y_top}
         else:
             l1_in, l2_in, l3_in, l4_in = params[7], params[8], params[9], params[10]
-            x_left = x_min_line - m
-            x_right = x_max_line + m
-
-            h_y_avg = (hL[1] + hR[1]) / 2
-            l_y_avg = (lL[1] + lR[1]) / 2
-            if h_y_avg > l_y_avg:
-                y_hi_L = hL[1] - l1_in; y_hi_R = hR[1] - l2_in
-                y_lo_L = lL[1] + l3_in; y_lo_R = lR[1] + l4_in
-            else:
-                y_hi_L = hL[1] + l1_in; y_hi_R = hR[1] + l2_in
-                y_lo_L = lL[1] - l3_in; y_lo_R = lR[1] - l4_in
-
-            if abs(hR[0] - hL[0]) > 1e-6:
-                k_hi = (y_hi_R - y_hi_L) / (hR[0] - hL[0])
-                b_hi = y_hi_L - k_hi * hL[0]
-            else:
-                k_hi, b_hi = 0.0, y_hi_L
-            if abs(lR[0] - lL[0]) > 1e-6:
-                k_lo = (y_lo_R - y_lo_L) / (lR[0] - lL[0])
-                b_lo = y_lo_L - k_lo * lL[0]
-            else:
-                k_lo, b_lo = 0.0, y_lo_L
+            x_left = x_min_line - m; x_right = x_max_line + m
             base_info = {'l1': l1_in, 'l2': l2_in, 'l3': l3_in, 'l4': l4_in,
-                         'y_bot': min(y_lo_L, y_lo_R), 'y_top': max(y_hi_L, y_hi_R)}
+                         'y_bot': min(bL_pre[1], bR_pre[1]),
+                         'y_top': max(aL_pre[1], aR_pre[1])}
 
-        y_top_left = k_hi * x_left + b_hi
-        y_top_right = k_hi * x_right + b_hi
-        y_bot_left = k_lo * x_left + b_lo
-        y_bot_right = k_lo * x_right + b_lo
+        y_top_left = k_hi * x_left + b_hi; y_top_right = k_hi * x_right + b_hi
+        y_bot_left = k_lo * x_left + b_lo; y_bot_right = k_lo * x_right + b_lo
 
-        poly_pts = [
-            (x_left, y_bot_left),
-            (x_right, y_bot_right),
-            (x_right, y_top_right),
-            (x_left, y_top_left),
-        ]
-        ax.add_patch(Polygon(poly_pts, closed=True, linewidth=1.2, edgecolor='black',
+        ax.add_patch(Polygon([(x_left, y_bot_left), (x_right, y_bot_right),
+                              (x_right, y_top_right), (x_left, y_top_left)],
+                             closed=True, linewidth=1.2, edgecolor='black',
                              facecolor='none', linestyle='--', label="基座外框"))
 
-        y_width_left = y_top_left - y_bot_left
+        y_top_edge_max = max(y_top_left, y_top_right)
+        y_bot_edge_min = min(y_bot_left, y_bot_right)
+        x_rect_mid = (x_left + x_right) / 2.0
+        y_top_at_mid = k_hi * x_rect_mid + b_hi
+        y_bot_at_mid = k_lo * x_rect_mid + b_lo
+
+        ax.text(x_rect_mid, y_top_at_mid + 200, "高端",
+                ha='center', va='bottom', fontsize=11, fontweight='bold',
+                color='black', zorder=15)
+        ax.text(x_rect_mid, y_bot_at_mid - 200, "低端",
+                ha='center', va='top', fontsize=11, fontweight='bold',
+                color='black', zorder=15)
+
         g = self._draw_vertical_dim(x_left, y_bot_left, y_top_left,
-                                     f"Y:{y_width_left:.1f}", -600, 'base_Y')
+                                     f"Y:{y_top_left - y_bot_left:.1f}", -600, 'base_Y')
         self.draggable_groups.append(g)
 
         z_info = {}
         for side in ('L', 'R'):
-            h = pts[(gear, side, 'H')]
-            l = pts[(gear, side, 'L')]
-            mag = mag_L if side == 'L' else mag_R
+            h = pts[(gear, side, 'H')]; l = pts[(gear, side, 'L')]
+            mag_eff = mag_L_eff if side == 'L' else mag_R_eff
+            cx = (h[0] + l[0]) / 2.0; cy = (h[1] + l[1]) / 2.0
+            h_draw_x = cx + (h[0] - cx) * mag_eff
+            l_draw_x = cx + (l[0] - cx) * mag_eff
 
-            cx = (h[0] + l[0]) / 2.0
-            cy = (h[1] + l[1]) / 2.0
-            h_draw_x = cx + (h[0] - cx) * mag
-            l_draw_x = cx + (l[0] - cx) * mag
-
-            vx = h_draw_x - l_draw_x
-            vy = h[1] - l[1]
+            vx = h_draw_x - l_draw_x; vy = h[1] - l[1]
             L_axis = math.hypot(vx, vy)
             if L_axis < 1e-6:
                 continue
             ux, uy = vx / L_axis, vy / L_axis
             nx, ny = -uy, ux
 
-            L_tire, w_tire = 800, 500
-            P_tire = [
+            L_tire, w_tire = 1500, 1000
+            ax.add_patch(Polygon([
                 (cx + L_tire / 2 * ux + w_tire / 2 * nx, cy + L_tire / 2 * uy + w_tire / 2 * ny),
                 (cx - L_tire / 2 * ux + w_tire / 2 * nx, cy - L_tire / 2 * uy + w_tire / 2 * ny),
                 (cx - L_tire / 2 * ux - w_tire / 2 * nx, cy - L_tire / 2 * uy - w_tire / 2 * ny),
                 (cx + L_tire / 2 * ux - w_tire / 2 * nx, cy + L_tire / 2 * uy - w_tire / 2 * ny)
-            ]
-            ax.add_patch(Polygon(P_tire, closed=True, facecolor='white', edgecolor='black', lw=1.5, zorder=9))
+            ], closed=True, facecolor='white', edgecolor='black', lw=1.5, zorder=9))
 
-            w_shaft = 100
-            P_hi = [
+            w_shaft = 400
+            ax.add_patch(Polygon([
                 (h_draw_x + w_shaft / 2 * nx, h[1] + w_shaft / 2 * ny),
                 (cx + L_tire / 2 * ux + w_shaft / 2 * nx, cy + L_tire / 2 * uy + w_shaft / 2 * ny),
                 (cx + L_tire / 2 * ux - w_shaft / 2 * nx, cy + L_tire / 2 * uy - w_shaft / 2 * ny),
                 (h_draw_x - w_shaft / 2 * nx, h[1] - w_shaft / 2 * ny)
-            ]
-            ax.add_patch(Polygon(P_hi, closed=True, facecolor='#dddddd', edgecolor='black', lw=1.0, zorder=8))
-            P_lo = [
+            ], closed=True, facecolor='#dddddd', edgecolor='black', lw=1.0, zorder=8))
+            ax.add_patch(Polygon([
                 (l_draw_x + w_shaft / 2 * nx, l[1] + w_shaft / 2 * ny),
                 (cx - L_tire / 2 * ux + w_shaft / 2 * nx, cy - L_tire / 2 * uy + w_shaft / 2 * ny),
                 (cx - L_tire / 2 * ux - w_shaft / 2 * nx, cy - L_tire / 2 * uy - w_shaft / 2 * ny),
                 (l_draw_x - w_shaft / 2 * nx, l[1] - w_shaft / 2 * ny)
-            ]
-            ax.add_patch(Polygon(P_lo, closed=True, facecolor='#dddddd', edgecolor='black', lw=1.0, zorder=8))
+            ], closed=True, facecolor='#dddddd', edgecolor='black', lw=1.0, zorder=8))
 
             ax.plot(h_draw_x, h[1], 'ro', markersize=4, zorder=11)
             ax.plot(l_draw_x, l[1], 'ro', markersize=4, zorder=11)
 
-            def find_intersect(h_pt, l_pt, k_e, b_e, h_dx, l_dx):
-                hx, hy, hz = h_pt[0], h_pt[1], h_pt[2]
-                lx, ly, lz = l_pt[0], l_pt[1], l_pt[2]
-                denom = (hy - ly) - k_e * (hx - lx)
-                if abs(denom) < 1e-9:
-                    t = 1.0
-                else:
-                    t = (k_e * lx + b_e - ly) / denom
-                x_real = lx + t * (hx - lx)
-                y_real = ly + t * (hy - ly)
-                z_real = lz + t * (hz - lz)
-                x_draw = l_dx + t * (h_dx - l_dx)
-                return x_real, y_real, z_real, x_draw
+            hx, hy, hz = h; lx, ly, lz = l
+            denom = (hy - ly) - k_hi * (hx - lx)
+            t_hi = 1.0 if abs(denom) < 1e-9 else (k_hi * lx + b_hi - ly) / denom
+            a_x_real = lx + t_hi * (hx - lx); a_y = ly + t_hi * (hy - ly); a_z = lz + t_hi * (hz - lz)
+            a_x_draw = l_draw_x + t_hi * (h_draw_x - l_draw_x)
 
-            a_x_real, a_y, a_z, a_x_draw = find_intersect(h, l, k_hi, b_hi, h_draw_x, l_draw_x)
-            b_x_real, b_y, b_z, b_x_draw = find_intersect(h, l, k_lo, b_lo, h_draw_x, l_draw_x)
+            denom = (hy - ly) - k_lo * (hx - lx)
+            t_lo = 1.0 if abs(denom) < 1e-9 else (k_lo * lx + b_lo - ly) / denom
+            b_x_real = lx + t_lo * (hx - lx); b_y = ly + t_lo * (hy - ly); b_z = lz + t_lo * (hz - lz)
+            b_x_draw = l_draw_x + t_lo * (h_draw_x - l_draw_x)
 
             ax.plot(a_x_draw, a_y, 'ro', markersize=4, zorder=12)
             ax.plot(b_x_draw, b_y, 'ro', markersize=4, zorder=12)
@@ -1065,52 +1200,45 @@ class TurretPositionWindow(tk.Toplevel):
                             'x_hi': a_x_real, 'x_lo': b_x_real,
                             'x_draw_hi': a_x_draw, 'x_draw_lo': b_x_draw}
 
-            y_hi_at_H = k_hi * h[0] + b_hi
-            y_lo_at_L = k_lo * l[0] + b_lo
+            y_hi_at_H = k_hi * h[0] + b_hi; y_lo_at_L = k_lo * l[0] + b_lo
             v_off = -400 if side == 'L' else 400
-            g1 = self._draw_vertical_dim(h_draw_x, h[1], y_hi_at_H,
-                                          f"{abs(h[1] - y_hi_at_H):.1f}",
-                                          v_off, f'v_off_hi_{side}')
-            self.draggable_groups.append(g1)
-            g2 = self._draw_vertical_dim(l_draw_x, l[1], y_lo_at_L,
-                                          f"{abs(l[1] - y_lo_at_L):.1f}",
-                                          v_off, f'v_off_lo_{side}')
-            self.draggable_groups.append(g2)
+            self.draggable_groups.append(self._draw_vertical_dim(
+                h_draw_x, h[1], y_hi_at_H, f"{abs(h[1] - y_hi_at_H):.1f}",
+                v_off, f'v_off_hi_{side}'))
+            self.draggable_groups.append(self._draw_vertical_dim(
+                l_draw_x, l[1], y_lo_at_L, f"{abs(l[1] - y_lo_at_L):.1f}",
+                v_off, f'v_off_lo_{side}'))
 
-            base_x_draw = line1_x_abs if side == 'L' else line2_x_abs
-            base_x_real = line1_x_abs if side == 'L' else line2_x_abs
-            g3 = self._draw_horizontal_dim(base_x_draw, a_x_draw, a_y,
-                                            f"{abs(a_x_real - base_x_real):.1f}",
-                                            150, f'h_off_hi_{side}')
-            self.draggable_groups.append(g3)
-            g4 = self._draw_horizontal_dim(base_x_draw, b_x_draw, b_y,
-                                            f"{abs(b_x_real - base_x_real):.1f}",
-                                            -150, f'h_off_lo_{side}')
-            self.draggable_groups.append(g4)
+            base_x = line1_x_abs if side == 'L' else line2_x_abs
+            self.draggable_groups.append(self._draw_horizontal_dim(
+                base_x, a_x_draw, a_y, f"{abs(a_x_real - base_x):.1f}",
+                150, f'h_off_hi_{side}'))
+            self.draggable_groups.append(self._draw_horizontal_dim(
+                base_x, b_x_draw, b_y, f"{abs(b_x_real - base_x):.1f}",
+                -150, f'h_off_lo_{side}'))
 
         y_all = [y_top_left, y_top_right, y_bot_left, y_bot_right]
         cx_rect_all = (x_left + x_right) / 2.0
         cy_rect_all = (min(y_all) + max(y_all)) / 2.0
-        marker = self._draw_rect_center_marker(gear, cx_rect_all, cy_rect_all,
-                                                x_right - x_left, max(y_all) - min(y_all))
-        self.draggable_groups.append(marker)
+        self.draggable_groups.append(self._draw_rect_center_marker(
+            gear, cx_rect_all, cy_rect_all,
+            x_right - x_left, max(y_all) - min(y_all)))
 
         if 'L' in z_info and 'R' in z_info:
             for side in ('L', 'R'):
                 dx_val = abs(z_info[side]['x_hi'] - z_info[side]['x_lo'])
                 y_mid_s = (z_info[side]['top'] + z_info[side]['bot']) / 2
-                g = self._draw_horizontal_dim(z_info[side]['x_draw_hi'],
-                                               z_info[side]['x_draw_lo'],
-                                               y_mid_s, f"{dx_val:.1f}", 0, f'dx_{side}',
-                                               y1=z_info[side]['top'], y2=z_info[side]['bot'])
-                self.draggable_groups.append(g)
+                self.draggable_groups.append(self._draw_horizontal_dim(
+                    z_info[side]['x_draw_hi'], z_info[side]['x_draw_lo'],
+                    y_mid_s, f"{dx_val:.1f}", 0, f'dx_{side}',
+                    y1=z_info[side]['top'], y2=z_info[side]['bot']))
 
-            z_top_L = z_info['L']['z_top']
-            z_top_R = z_info['R']['z_top']
-            y_top_base = y_hi_plot + 1500
+            # 高端垂直面
+            z_top_L = z_info['L']['z_top']; z_top_R = z_info['R']['z_top']
+            y_top_base = y_top_edge_max + 1000
             z_base = min(z_top_L, z_top_R)
-            y_L_top = y_top_base + (z_top_L - z_base) * mag_z
-            y_R_top = y_top_base + (z_top_R - z_base) * mag_z
+            y_L_top = y_top_base + (z_top_L - z_base) * mag_za_eff
+            y_R_top = y_top_base + (z_top_R - z_base) * mag_za_eff
             x_circ_L = x_left + (x_right - x_left) * 0.3
             x_circ_R = x_left + (x_right - x_left) * 0.7
             r_circ = 120
@@ -1125,19 +1253,19 @@ class TurretPositionWindow(tk.Toplevel):
             dim_top = self._draw_vertical_dim(x_circ_R + r_circ + 100, y_L_top, y_R_top,
                                                f"Δza={z_top_R - z_top_L:+.2f}", 150, 'dz_top')
             title_top = ax.text((x_circ_L + x_circ_R) / 2, y_top_base + 400,
-                                f"高端垂直面示意图 (za, 放大{mag_z}倍)", ha='center', fontsize=10,
-                                fontweight='bold', picker=5,
+                                "高端垂直面示意图",
+                                ha='center', fontsize=10, fontweight='bold', picker=5,
                                 bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.85))
             self.draggable_groups.append({'type': 'group', 'artists': [
                 c1, c2, d1, d2, cl1, cl2, title_top,
                 dim_top['l1'], dim_top['l2'], dim_top['l3'], dim_top['t']]})
 
-            z_bot_L = z_info['L']['z_bot']
-            z_bot_R = z_info['R']['z_bot']
-            y_bot_base = y_lo_plot - 1500
+            # 低端垂直面
+            z_bot_L = z_info['L']['z_bot']; z_bot_R = z_info['R']['z_bot']
+            y_bot_base = y_bot_edge_min - 1000
             z_base2 = min(z_bot_L, z_bot_R)
-            y_L_bot = y_bot_base + (z_bot_L - z_base2) * mag_z
-            y_R_bot = y_bot_base + (z_bot_R - z_base2) * mag_z
+            y_L_bot = y_bot_base + (z_bot_L - z_base2) * mag_zb_eff
+            y_R_bot = y_bot_base + (z_bot_R - z_base2) * mag_zb_eff
             c3 = Circle((x_circ_L, y_L_bot), r_circ, fill=False, ec='black', lw=1.5, picker=5)
             c4 = Circle((x_circ_R, y_R_bot), r_circ, fill=False, ec='black', lw=1.5, picker=5)
             ax.add_patch(c3); ax.add_patch(c4)
@@ -1148,13 +1276,14 @@ class TurretPositionWindow(tk.Toplevel):
             dim_bot = self._draw_vertical_dim(x_circ_R + r_circ + 100, y_L_bot, y_R_bot,
                                                f"Δzb={z_bot_R - z_bot_L:+.2f}", 150, 'dz_bot')
             title_bot = ax.text((x_circ_L + x_circ_R) / 2, y_bot_base - 500,
-                                f"低端垂直面示意图 (zb, 放大{mag_z}倍)", ha='center', fontsize=10,
-                                fontweight='bold', picker=5,
+                                "低端垂直面示意图",
+                                ha='center', fontsize=10, fontweight='bold', picker=5,
                                 bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.85))
             self.draggable_groups.append({'type': 'group', 'artists': [
                 c3, c4, d3, d4, cl3, cl4, title_bot,
                 dim_bot['l1'], dim_bot['l2'], dim_bot['l3'], dim_bot['t']]})
 
+            # tanθ 三角形
             def draw_tan_triangle(x_anchor, y_center, tan_val, side_label, y_len):
                 L_y = max(y_len / 4.0, 200.0)
                 ratio = max(0.25, min(1.0, 0.25 + tan_val / 100.0 * 3.0))
@@ -1182,19 +1311,17 @@ class TurretPositionWindow(tk.Toplevel):
 
             dy_L = abs(hL[1] - lL[1]); dz_L = abs(hL[2] - lL[2])
             tan_L = (dz_L / dy_L * 100) if dy_L > 1e-6 else 0.0
-            tri_L = draw_tan_triangle(x_left - 1500, (z_info['L']['top'] + z_info['L']['bot']) / 2,
-                                       tan_L, "左", max(y_all) - min(y_all))
-            self.draggable_groups.append(tri_L)
+            self.draggable_groups.append(draw_tan_triangle(
+                x_left - 1500, (z_info['L']['top'] + z_info['L']['bot']) / 2,
+                tan_L, "左", max(y_all) - min(y_all)))
             dy_R = abs(hR[1] - lR[1]); dz_R = abs(hR[2] - lR[2])
             tan_R = (dz_R / dy_R * 100) if dy_R > 1e-6 else 0.0
-            tri_R = draw_tan_triangle(x_right + 1500, (z_info['R']['top'] + z_info['R']['bot']) / 2,
-                                       tan_R, "右", max(y_all) - min(y_all))
-            self.draggable_groups.append(tri_R)
+            self.draggable_groups.append(draw_tan_triangle(
+                x_right + 1500, (z_info['R']['top'] + z_info['R']['bot']) / 2,
+                tan_R, "右", max(y_all) - min(y_all)))
 
         ax.set_xlabel("x (mm) 横向")
         ax.set_ylabel("y (mm) 窑轴向")
-        ax.set_title(f"{GEAR_NAMES[gear]}托轮倾斜与高差  [模式 {mode}]  "
-                     f"(L放大{mag_L}/R放大{mag_R}/Z放大{mag_z})")
 
         handles, labels = ax.get_legend_handles_labels()
         unique = dict(zip(labels, handles))
@@ -1221,4 +1348,18 @@ class TurretPositionWindow(tk.Toplevel):
         self.rs.set_active(self.zoom_mode.get())
         self.canvas.draw_idle()
         self._update_summary(mode, gear, pts, X, m, mag_L, mag_R, mag_z,
-                             base_info, z_info, line1_x_abs)
+                             base_info, z_info, line1_x_abs,
+                             boost_L, boost_R, boost_za, boost_zb,
+                             auto_applied, gear_mag_info)
+
+
+def main():
+    root = tk.Tk()
+    root.withdraw()
+    win = TurretPositionWindow(root)
+    win.protocol("WM_DELETE_WINDOW", root.destroy)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
